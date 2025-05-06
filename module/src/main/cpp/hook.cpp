@@ -1,99 +1,108 @@
 #include <android/log.h>
 #include <unistd.h>
 #include <vector>
+#include <filesystem>
 
+#include "zygisk_api.h"
 #include "zygisk_next_api.h"
+#include "utils.hpp"
 
 #define LOG_TAG "znmodsample"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-static ZygiskNextAPI api_table;
-void* handle;
+#define DEX_PATH "/data/adb/modules/znmodsample/classes.dex"
 
-// backup of old __openat function
-static int (*old_openat)(int fd, const char* pathname, int flag, int mode) = nullptr;
-// our replacement for __openat function
-static int my_openat(int fd, const char* pathname, int flag, int mode) {
-    auto r = old_openat(fd, pathname, flag, mode);
-    int e = errno;
-
-    auto cp_fd = api_table.connectCompanion(handle);
-    int sz;
-    if (cp_fd < 0) {
-        goto my_openat_finish;
-    }
-    sz = strlen(pathname);
-    TEMP_FAILURE_RETRY(write(cp_fd, &sz, sizeof(sz)));
-    TEMP_FAILURE_RETRY(write(cp_fd, pathname, sz));
-    close(cp_fd);
-
-my_openat_finish:
-    errno = e;
-    return r;
-}
-
-// this function will be called after all of the main executable's needed libraries are loaded
-// and before the entry of the main executable called
-void onModuleLoaded(void* self_handle, const struct ZygiskNextAPI* api) {
-    // You need to copy the api table if you want to use it after this callback finished
-    memcpy(&api_table, api, sizeof(struct ZygiskNextAPI));
-    handle = self_handle;
-
-    auto resolver = api_table.newSymbolResolver("libc.so", nullptr);
-    if (!resolver) {
-        LOGE("create resolver failed");
-        return;
+class ZNModSample : public zygisk::ModuleBase {
+public:
+    void onLoad(zygisk::Api *api, JNIEnv *env) override {
+        this->api = api;
+        this->env = env;
     }
 
-    size_t sz;
-    auto addr = api_table.symbolLookup(resolver, "__openat", false, &sz);
+    void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
+        // Convert the Java string representing the application name to a C string
+        const char *rawName = env->GetStringUTFChars(args->nice_name, nullptr);
+        if (!rawName) return;  // Return if we failed to get the string
 
-    api_table.freeSymbolResolver(resolver);
+        std::string name;
+        name = rawName;  // Copy the C string into a std::string
+        env->ReleaseStringUTFChars(args->nice_name, rawName);  // Release the string resource
 
-    if (addr == nullptr) {
-        LOGE("failed to find __openat");
-        return;
+        // If the application name is not "com.android.systemui", close the module library and return
+        if (name != "com.android.systemui") {
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);  // Close the module library
+            return;
+        }
+
+        // Try to connect to the companion process and obtain a file descriptor (fd)
+        int fd = api->connectCompanion();
+        if (fd < 0) {
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);  // Close the module library on error
+            return;
+        }
+
+        // Read the size of the dex data from the companion process
+        size_t dexSize = 0;
+        if (utils::xread(fd, &dexSize, sizeof(size_t)) < 0 || !dexSize) {
+            close(fd);  // Close the file descriptor in case of failure
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);  // Close the module library
+            return;
+        }
+
+        // Resize the dex vector to hold the dex data based on the read size
+        dexVector.resize(dexSize);
+        // Read the actual dex data from the companion process into the vector
+        if (utils::xread(fd, dexVector.data(), dexSize) < 0) {
+            dexVector.clear();  // Clear the vector in case of an error
+            dexVector.shrink_to_fit();
+            close(fd);  // Close the file descriptor
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);  // Close the module library
+            return;
+        }
+
+        // Successfully read the dex data, so close the file descriptor
+        close(fd);
+
+        LOGD("Loaded DEX (size=%zu)", dexSize);
     }
 
-    // inline hook netd's openat function
-    if (api_table.inlineHook(addr, (void *) my_openat, (void**) &old_openat) == ZN_SUCCESS) {
-        LOGI("inline hook success %p", old_openat);
-    } else {
-        LOGE("inline hook failed");
-    }
-}
+    void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
+        if (dexVector.empty()) return;
 
-// declaration of the zygisk next module
-__attribute__((visibility("default"), unused))
-struct ZygiskNextModule zn_module = {
-    .target_api_version = ZYGISK_NEXT_API_VERSION_1,
-    .onModuleLoaded = onModuleLoaded,
+        injectDex();
+
+        dexVector.clear();
+        dexVector.shrink_to_fit();
+    }
+
+    void preServerSpecialize(zygisk::ServerSpecializeArgs *args) override {
+        api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+    }
+
+private:
+    zygisk::Api *api;
+    JNIEnv *env;
+    std::vector<char> dexVector;
+
+    void injectDex() {
+        
+    }
 };
 
-static void onCompanionLoaded() {
-    LOGI("companion loaded");
-}
+static void companion(int fd) {
+    std::vector<char> dex;
 
-static void onModuleConnected(int fd) {
-    int sz;
-    std::vector<char> buf;
-    TEMP_FAILURE_RETRY(read(fd, &sz, sizeof(sz)));
-    if (sz > 1024 || sz < 0) {
-        goto close_fd;
+    if (std::filesystem::exists(DEX_PATH)) {
+        dex = utils::readFile(DEX_PATH);
     }
-    buf.resize(sz + 1);
-    TEMP_FAILURE_RETRY(read(fd, buf.data(), sz));
-    buf[sz] = 0;
-    LOGI("opened: %s", buf.data());
-close_fd:
-    close(fd);
+
+    size_t dexSize = dex.size();
+    utils::xwrite(fd, &dexSize, sizeof(size_t));
+
+    if (dexSize) utils::xwrite(fd, dex.data(), dexSize);
 }
 
-__attribute__((visibility("default"), unused))
-struct ZygiskNextCompanionModule zn_companion_module = {
-    .target_api_version = ZYGISK_NEXT_API_VERSION_1,
-    .onCompanionLoaded = onCompanionLoaded,
-    .onModuleConnected = onModuleConnected,
-};
+REGISTER_ZYGISK_MODULE(ZNModSample)
+REGISTER_ZYGISK_COMPANION(companion)

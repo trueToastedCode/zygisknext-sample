@@ -1,0 +1,3 @@
+-dontoptimize
+-dontobfuscate
+-keep class ** { *; }

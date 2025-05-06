@@ -66,10 +66,8 @@ ui_print "- Extracting module files"
 extract "$ZIPFILE" 'module.prop'     "$MODPATH"
 extract "$ZIPFILE" 'post-fs-data.sh' "$MODPATH"
 extract "$ZIPFILE" 'service.sh'      "$MODPATH"
-extract "$ZIPFILE" 'zn_modules.txt'  "$MODPATH"
+extract "$ZIPFILE" 'classes.dex'     "$MODPATH"
 mv "$TMPDIR/sepolicy.rule" "$MODPATH"
 
-mkdir "$MODPATH/lib"
-
-ui_print "- Extracting $ARCH libraries"
-extract "$ZIPFILE" "lib/$ARCH/lib$SONAME.so" "$MODPATH/lib" true
+ui_print "- Extracting libraries"
+unzip -o "$ZIPFILE" "zygisk/*" -d "$MODPATH" >&2

@@ -43,6 +43,16 @@ android {
             path("src/main/cpp/CMakeLists.txt")
         }
     }
+    buildTypes {
+        debug {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            multiDexEnabled = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+            )
+        }
+    }
 }
 
 val abiMap = mapOf(
@@ -97,8 +107,13 @@ androidComponents.onVariants { variant ->
             abiList.forEach { abi ->
                 val arch = abiMap[abi]
                 from(layout.buildDirectory.file("intermediates/stripped_native_libs/$variantLowered/strip${variantCapped}DebugSymbols/out/lib/$abi")) {
-                    into("lib/$arch")
+                    into("zygisk")
+                    rename { fileName -> "${abi}.so" }
                 }
+            }
+
+            from(layout.buildDirectory.file("intermediates/dex/$variantLowered/minify${variantCapped}WithR8/classes.dex").get().asFile) {
+                into(".")
             }
 
             doLast {
