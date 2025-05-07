@@ -1,3 +1,2 @@
--dontoptimize
 -dontobfuscate
--keep class ** { *; }
+-keep class de.truetoastedcode.znmodsample.EntryPoint {public <methods>;}

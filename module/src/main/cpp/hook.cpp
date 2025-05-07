@@ -2,6 +2,8 @@
 #include <unistd.h>
 #include <vector>
 #include <filesystem>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #include "zygisk_api.h"
 #include "zygisk_next_api.h"
@@ -13,6 +15,38 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 #define DEX_PATH "/data/adb/modules/znmodsample/classes.dex"
+#define SYSTEMUI_MARKER "/dev/znmodsample_systemui_done"
+
+bool wasHandled() {
+    struct stat buffer;
+    bool exists = (stat(SYSTEMUI_MARKER, &buffer) == 0);
+    LOGD("Marker file exists: %d", exists);
+    return exists;
+}
+
+bool setHandled() {
+    int fd = open(SYSTEMUI_MARKER, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd == -1) {
+        LOGE("Failed to create marker file: %s (errno: %d)", SYSTEMUI_MARKER, errno);
+        return false;
+    }
+    
+    // Write a content marker
+    const char *content = "1";
+    ssize_t result = write(fd, content, 1);
+    close(fd);
+    
+    // Ensure file is readable by all processes
+    chmod(SYSTEMUI_MARKER, 0666);
+    
+    if (result != 1) {
+        LOGE("Failed to write to marker file (result: %zd, errno: %d)", result, errno);
+        return false;
+    }
+    
+    LOGD("Successfully created marker file");
+    return true;
+}
 
 class ZNModSample : public zygisk::ModuleBase {
 public:
@@ -37,8 +71,9 @@ public:
         }
 
         // Try to connect to the companion process and obtain a file descriptor (fd)
-        int fd = api->connectCompanion();
+        auto fd = api->connectCompanion();
         if (fd < 0) {
+            LOGE("failed to connect companion");
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);  // Close the module library on error
             return;
         }
@@ -46,6 +81,7 @@ public:
         // Read the size of the dex data from the companion process
         size_t dexSize = 0;
         if (utils::xread(fd, &dexSize, sizeof(size_t)) < 0 || !dexSize) {
+            LOGD("received no dex to inject");
             close(fd);  // Close the file descriptor in case of failure
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);  // Close the module library
             return;
@@ -87,11 +123,79 @@ private:
     std::vector<char> dexVector;
 
     void injectDex() {
-        
+        LOGD("invoke System-ClassLoader");
+        auto clClass = env->FindClass("java/lang/ClassLoader");
+        auto getSystemClassLoader = env->GetStaticMethodID(
+            clClass, "getSystemClassLoader", "()Ljava/lang/ClassLoader;");
+        auto systemClassLoader = env->CallStaticObjectMethod(clClass, getSystemClassLoader);
+
+        if (env->ExceptionCheck()) {
+            LOGE("failed to invoke System-ClassLoader");
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            return;
+        }
+
+        LOGD("make InMemoryDexClassLoader");
+        auto dexClClass = env->FindClass("dalvik/system/InMemoryDexClassLoader");
+        auto dexClInit = env->GetMethodID(
+            dexClClass, "<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
+        auto buffer = env->NewDirectByteBuffer(
+            dexVector.data(), static_cast<jlong>(dexVector.size()));
+        auto dexCl = env->NewObject(dexClClass, dexClInit, buffer, systemClassLoader);
+
+        if (env->ExceptionCheck()) {
+            LOGE("failed to make InMemoryDexClassLoader");
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            return;
+        }
+
+        LOGD("load entry point class");
+        auto loadClass = env->GetMethodID(
+            clClass, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+        auto entryClassName = env->NewStringUTF("de.truetoastedcode.znmodsample.EntryPoint");
+        auto entryClassObj = env->CallObjectMethod(dexCl, loadClass, entryClassName);
+        auto entryPointClass = (jclass) entryClassObj;
+
+        if (env->ExceptionCheck()) {
+            LOGE("failed to load entry point class");
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            return;
+        }
+
+        LOGD("call entry point init");
+        auto entryInit = env->GetStaticMethodID(entryPointClass, "init", "()V");
+        env->CallStaticVoidMethod(entryPointClass, entryInit);
+
+        if (env->ExceptionCheck()) {
+            LOGE("failed to call entry point init");
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+        }
+
+        env->DeleteLocalRef(entryClassName);
+        env->DeleteLocalRef(entryClassObj);
+        env->DeleteLocalRef(dexCl);
+        env->DeleteLocalRef(buffer);
+        env->DeleteLocalRef(dexClClass);
+        env->DeleteLocalRef(clClass);
+
+        LOGD("jni memory free");
     }
 };
 
 static void companion(int fd) {
+    if (wasHandled()) {
+        size_t dexSize = 0;
+        utils::xwrite(fd, &dexSize, sizeof(size_t));
+        close(fd);
+        return;
+    }
+
+    setHandled();
+
     std::vector<char> dex;
 
     if (std::filesystem::exists(DEX_PATH)) {
@@ -101,7 +205,11 @@ static void companion(int fd) {
     size_t dexSize = dex.size();
     utils::xwrite(fd, &dexSize, sizeof(size_t));
 
-    if (dexSize) utils::xwrite(fd, dex.data(), dexSize);
+    if (dexSize) {
+        utils::xwrite(fd, dex.data(), dexSize);
+    }
+
+    close(fd);
 }
 
 REGISTER_ZYGISK_MODULE(ZNModSample)
