@@ -8,6 +8,7 @@
 #include "zygisk_api.h"
 #include "zygisk_next_api.h"
 #include "utils.hpp"
+#include "scopedlocalref.hpp"
 
 #define LOG_TAG "znmodsample"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
@@ -121,68 +122,109 @@ private:
     zygisk::Api *api;
     JNIEnv *env;
     std::vector<char> dexVector;
+    void *buffer = nullptr;
 
     void injectDex() {
-        LOGD("invoke System-ClassLoader");
+        enum RefE {
+            ClClass,
+            SystemClassLoader,
+            DexClClass,
+            Buffer,
+            DexCl,
+            EntryClassName,
+            EntryClassObj
+        };
+
+        auto ref = scopedlocalref::make_scoped_ref(
+            [](
+                jclass clClass,
+                jobject systemClassLoader,
+                jclass dexClClass,
+                jobject buffer,
+                jobject dexCl,
+                jstring entryClassName,
+                jobject entryClassObj,
+                JNIEnv *env
+            ) {
+                if (clClass) env->DeleteLocalRef(clClass);
+                if (systemClassLoader) env->DeleteLocalRef(systemClassLoader);
+                if (dexClClass) env->DeleteLocalRef(dexClClass);
+                if (buffer) env->DeleteLocalRef(buffer);
+                if (dexCl) env->DeleteLocalRef(dexCl);
+                if (entryClassName) env->DeleteLocalRef(entryClassName);
+                if (entryClassObj) env->DeleteLocalRef(entryClassObj);
+                LOGD("JNI resources released!");
+            },
+            static_cast<jclass>(nullptr),
+            static_cast<jobject>(nullptr),
+            static_cast<jclass>(nullptr),
+            static_cast<jobject>(nullptr),
+            static_cast<jobject>(nullptr),
+            static_cast<jstring>(nullptr),
+            static_cast<jobject>(nullptr),
+            env
+        );
+
+        LOGD("Invoke System-ClassLoader");
         auto clClass = env->FindClass("java/lang/ClassLoader");
+        if (ref.try_set<RefE::ClClass>(clClass)) return;
         auto getSystemClassLoader = env->GetStaticMethodID(
             clClass, "getSystemClassLoader", "()Ljava/lang/ClassLoader;");
         auto systemClassLoader = env->CallStaticObjectMethod(clClass, getSystemClassLoader);
+        if (ref.try_set<RefE::SystemClassLoader>(systemClassLoader)) return;
 
         if (env->ExceptionCheck()) {
-            LOGE("failed to invoke System-ClassLoader");
+            LOGE("Failed to invoke System-ClassLoader");
             env->ExceptionDescribe();
             env->ExceptionClear();
             return;
         }
 
-        LOGD("make InMemoryDexClassLoader");
+        LOGD("Make InMemoryDexClassLoader");
         auto dexClClass = env->FindClass("dalvik/system/InMemoryDexClassLoader");
+        if (ref.try_set<RefE::DexClClass>(dexClClass)) return;
         auto dexClInit = env->GetMethodID(
             dexClClass, "<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
         auto buffer = env->NewDirectByteBuffer(
             dexVector.data(), static_cast<jlong>(dexVector.size()));
+        if (ref.try_set<RefE::Buffer>(buffer)) return;
         auto dexCl = env->NewObject(dexClClass, dexClInit, buffer, systemClassLoader);
+        if (ref.try_set<RefE::DexCl>(dexCl)) return;
 
         if (env->ExceptionCheck()) {
-            LOGE("failed to make InMemoryDexClassLoader");
+            LOGE("Failed to make InMemoryDexClassLoader");
             env->ExceptionDescribe();
             env->ExceptionClear();
             return;
         }
 
-        LOGD("load entry point class");
+        LOGD("Load entry point class");
         auto loadClass = env->GetMethodID(
             clClass, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
         auto entryClassName = env->NewStringUTF("de.truetoastedcode.znmodsample.EntryPoint");
+        if (ref.try_set<RefE::EntryClassName>(entryClassName)) return;
         auto entryClassObj = env->CallObjectMethod(dexCl, loadClass, entryClassName);
-        auto entryPointClass = (jclass) entryClassObj;
+        if (ref.try_set<RefE::EntryClassObj>(entryClassObj)) return;
 
         if (env->ExceptionCheck()) {
-            LOGE("failed to load entry point class");
+            LOGE("Failed to load entry point class");
             env->ExceptionDescribe();
             env->ExceptionClear();
             return;
         }
 
-        LOGD("call entry point init");
-        auto entryInit = env->GetStaticMethodID(entryPointClass, "init", "()V");
-        env->CallStaticVoidMethod(entryPointClass, entryInit);
+        LOGD("Call entry point init");
+        auto entryInit = env->GetStaticMethodID(static_cast<jclass>(entryClassObj), "init", "()V");
+        env->CallStaticVoidMethod(static_cast<jclass>(entryClassObj), entryInit);
 
         if (env->ExceptionCheck()) {
-            LOGE("failed to call entry point init");
+            LOGE("Failed to call entry point init");
             env->ExceptionDescribe();
             env->ExceptionClear();
+            return;
         }
 
-        env->DeleteLocalRef(entryClassName);
-        env->DeleteLocalRef(entryClassObj);
-        env->DeleteLocalRef(dexCl);
-        env->DeleteLocalRef(buffer);
-        env->DeleteLocalRef(dexClClass);
-        env->DeleteLocalRef(clClass);
-
-        LOGD("jni memory free");
+        LOGD("DEX injected!");
     }
 };
 
