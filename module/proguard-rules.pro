@@ -1,2 +1,2 @@
 -dontobfuscate
--keep class de.truetoastedcode.znmodsample.EntryPoint {public <methods>;}
+-keep class ** { *; }

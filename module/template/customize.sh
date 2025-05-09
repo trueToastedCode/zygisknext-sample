@@ -71,3 +71,4 @@ mv "$TMPDIR/sepolicy.rule" "$MODPATH"
 
 ui_print "- Extracting libraries"
 unzip -o "$ZIPFILE" "zygisk/*" -d "$MODPATH" >&2
+unzip -o "$ZIPFILE" "lib/*" -d "$MODPATH" >&2

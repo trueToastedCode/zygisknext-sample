@@ -1,14 +1,33 @@
 #include <android/log.h>
+#include <android/dlext.h>
 #include <unistd.h>
 #include <vector>
 #include <filesystem>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <dlfcn.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <string.h>
 
 #include "zygisk_api.h"
 #include "zygisk_next_api.h"
 #include "utils.hpp"
 #include "resourceguard.hpp"
+
+#if defined(__aarch64__)
+#define ARCH "arm64"
+#elif defined(__arm__)
+#define ARCH "arm"
+#elif defined(__x86_64__)
+#define ARCH "x86_64"
+#elif defined(__i386__)
+#define ARCH "x86"
+#else
+#define ARCH "unknown"
+#endif
 
 #define LOG_TAG "znmodsample"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
@@ -16,7 +35,13 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 #define DEX_PATH "/data/adb/modules/znmodsample/classes.dex"
+#define LIB_PATH "/data/adb/modules/znmodsample/lib/%s/libentrypoint_lib.so"
 #define SYSTEMUI_MARKER "/dev/znmodsample_systemui_done"
+
+enum CompanionCmd {
+    LOAD_DEX_AND_LIB,
+    MOD_LIB
+};
 
 bool wasHandled() {
     struct stat buffer;
@@ -49,6 +74,80 @@ bool setHandled() {
     return true;
 }
 
+// Send a file descriptor over a socket
+bool send_fd(int socket, int fd) {
+    struct msghdr msg = {};
+    struct iovec iov;
+    char buf[1] = {0}; // Dummy data to ensure message is sent
+
+    // Set up the iovec for the dummy data
+    iov.iov_base = buf;
+    iov.iov_len = 1;
+
+    // Set up the message header
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    // Allocate space for control message (SCM_RIGHTS)
+    char cmsg_buf[CMSG_SPACE(sizeof(int))];
+    msg.msg_control = cmsg_buf;
+    msg.msg_controllen = sizeof(cmsg_buf);
+
+    // Set up the control message to send the file descriptor
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+
+    // Send the message
+    if (TEMP_FAILURE_RETRY(sendmsg(socket, &msg, 0)) < 0) {
+        LOGE("Failed to send file descriptor: %s", strerror(errno));
+        return false;
+    }
+
+    LOGD("File descriptor sent successfully");
+    return true;
+}
+
+// Receive a file descriptor from a socket
+int recv_fd(int socket) {
+    struct msghdr msg = {};
+    struct iovec iov;
+    char buf[1];
+
+    // Set up the iovec for the dummy data
+    iov.iov_base = buf;
+    iov.iov_len = 1;
+
+    // Set up the message header
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    // Allocate space for control message
+    char cmsg_buf[CMSG_SPACE(sizeof(int))];
+    msg.msg_control = cmsg_buf;
+    msg.msg_controllen = sizeof(cmsg_buf);
+
+    // Receive the message
+    if (TEMP_FAILURE_RETRY(recvmsg(socket, &msg, 0)) < 0) {
+        LOGE("Failed to receive file descriptor: %s", strerror(errno));
+        return -1;
+    }
+
+    // Extract the file descriptor from the control message
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (!cmsg || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
+        LOGE("No valid file descriptor received");
+        return -1;
+    }
+
+    int fd;
+    memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
+    LOGD("File descriptor received: %d", fd);
+    return fd;
+}
+
 class ZNModSample : public zygisk::ModuleBase {
 public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
@@ -72,46 +171,168 @@ public:
         }
 
         // Try to connect to the companion process and obtain a file descriptor (fd)
-        auto fd = api->connectCompanion();
-        if (fd < 0) {
+        auto cp_fd = api->connectCompanion();
+        if (cp_fd < 0) {
             LOGE("failed to connect companion");
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);  // Close the module library on error
             return;
         }
 
+        auto cmd = CompanionCmd::LOAD_DEX_AND_LIB;
+        utils::xwrite(cp_fd, &cmd, sizeof(cmd));
+
         // Read the size of the dex data from the companion process
         size_t dexSize = 0;
-        if (utils::xread(fd, &dexSize, sizeof(size_t)) < 0 || !dexSize) {
+        if (utils::xread(cp_fd, &dexSize, sizeof(size_t)) < 0 || !dexSize) {
             LOGD("received no dex to inject");
-            close(fd);  // Close the file descriptor in case of failure
+            close(cp_fd);  // Close the file descriptor in case of failure
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);  // Close the module library
             return;
         }
 
         // Resize the dex vector to hold the dex data based on the read size
         dexVector.resize(dexSize);
+
         // Read the actual dex data from the companion process into the vector
-        if (utils::xread(fd, dexVector.data(), dexSize) < 0) {
+        if (utils::xread(cp_fd, dexVector.data(), dexSize) < 0) {
             dexVector.clear();  // Clear the vector in case of an error
             dexVector.shrink_to_fit();
-            close(fd);  // Close the file descriptor
+            close(cp_fd);  // Close the file descriptor
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);  // Close the module library
             return;
         }
 
-        // Successfully read the dex data, so close the file descriptor
-        close(fd);
+        // Read the size of the lib data from the companion process
+        size_t libSize = 0;
+        if (utils::xread(cp_fd, &libSize, sizeof(size_t)) < 0 || !libSize) {
+            LOGD("received no lib to inject");
+            dexVector.clear();  // Clear the vector in case of an error
+            dexVector.shrink_to_fit();
+            close(cp_fd);  // Close the file descriptor in case of failure
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);  // Close the module library
+            return;
+        }
 
-        LOGD("Loaded DEX (size=%zu)", dexSize);
+        // Resize the lib vector to hold the dex data based on the read size
+        libVector.resize(libSize);
+
+        // Read the actual lib data from the companion process into the vector
+        if (utils::xread(cp_fd, libVector.data(), libSize) < 0) {
+            dexVector.clear();  // Clear the vector in case of an error
+            dexVector.shrink_to_fit();
+            libVector.clear();  // Clear the vector in case of an error
+            libVector.shrink_to_fit();
+            close(cp_fd);  // Close the file descriptor
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);  // Close the module library
+            return;
+        }
+
+        LOGD("Loaded DEX (size=%zu) and LIB (size=%zu)", dexSize, libSize);
+
+        // Create anonymous in-memory file descriptor
+        auto fd = static_cast<int>(syscall(SYS_memfd_create, "libentrypoint_lib.so", MFD_CLOEXEC));
+        if (fd == -1) {
+            LOGE("Failed to create memfd: %s", strerror(errno));
+            dexVector.clear();  // Clear the vector in case of an error
+            dexVector.shrink_to_fit();
+            libVector.clear();  // Clear the vector in case of an error
+            libVector.shrink_to_fit();
+            close(cp_fd);  // Close the file descriptor
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);  // Close the module library
+            return;
+        }
+    
+        // Write library data to memfd
+        auto written = write(fd, libVector.data(), libVector.size());
+        if (written != static_cast<ssize_t>(libVector.size())) {
+            LOGE("Failed to write library to memfd: %zd/%zu", written, libVector.size());
+            dexVector.clear();  // Clear the vector in case of an error
+            dexVector.shrink_to_fit();
+            libVector.clear();  // Clear the vector in case of an error
+            libVector.shrink_to_fit();
+            close(cp_fd);  // Close the file descriptor
+            close(fd);
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);  // Close the module library
+            return;
+        }
+
+        // Use companion to make privileged modifications using the file desciptor
+        // cmd = CompanionCmd::MOD_LIB;
+        cmd = static_cast<CompanionCmd>(-1);
+        utils::xwrite(cp_fd, &cmd, sizeof(cmd));
+
+        // if (!send_fd(cp_fd, fd)) {
+        //     LOGE("Failed to send file descriptor to companion");
+        //     dexVector.clear();
+        //     dexVector.shrink_to_fit();
+        //     libVector.clear();
+        //     libVector.shrink_to_fit();
+        //     close(fd);
+        //     close(cp_fd);
+        //     api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+        //     return;
+        // }
+
+        // int lib_mod_ack = -1;
+        // utils::xread(cp_fd, &lib_mod_ack, sizeof(lib_mod_ack));
+
+        // if (lib_mod_ack) {
+        //     LOGE("Lib mod failure ack: %d", lib_mod_ack);
+        //     dexVector.clear();
+        //     dexVector.shrink_to_fit();
+        //     libVector.clear();
+        //     libVector.shrink_to_fit();
+        //     close(fd);
+        //     close(cp_fd);
+        //     api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+        //     return;
+        // }
+
+        LOGD("Made anonymous in-memory file descriptor");
+
+        // Seek to start and construct /proc/self/fd path
+        lseek(fd, 0, SEEK_SET);
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+
+        // Set up the android_dlextinfo structure
+        android_dlextinfo dlextinfo;
+        memset(&dlextinfo, 0, sizeof(dlextinfo));
+        dlextinfo.flags = ANDROID_DLEXT_USE_LIBRARY_FD;
+        dlextinfo.library_fd = fd;
+
+        // Load library using android_dlopen_ext
+        LOGD("Attempting android_dlopen_ext with fd %d", fd);
+        lib_handle = android_dlopen_ext(path, RTLD_NOW | RTLD_GLOBAL, &dlextinfo);
+
+        if (!lib_handle) {
+            LOGE("android_dlopen_ext failed: %s", dlerror());
+            dexVector.clear();
+            dexVector.shrink_to_fit();
+            libVector.clear();
+            libVector.shrink_to_fit();
+            close(fd);
+            close(cp_fd);
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
+        LOGD("Loaded library successfully!");
+
+        close(fd);
+        close(cp_fd);
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        if (dexVector.empty()) return;
+        if (dexVector.empty() || libVector.empty() || !lib_handle) return;
 
         injectDex();
 
         dexVector.clear();
         dexVector.shrink_to_fit();
+        libVector.clear();
+        libVector.shrink_to_fit();
+        dlclose(lib_handle);
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs *args) override {
@@ -121,8 +342,9 @@ public:
 private:
     zygisk::Api *api;
     JNIEnv *env;
+    void *lib_handle;
     std::vector<char> dexVector;
-    void *buffer = nullptr;
+    std::vector<char> libVector;
 
     void injectDex() {
         enum RefE {
@@ -132,7 +354,9 @@ private:
             Buffer,
             DexCl,
             EntryClassName,
-            EntryClassObj
+            EntryClassObj,
+            ThreadClass,
+            CurrentThread
         };
 
         auto ref = resourceguard::make_resource_guard(
@@ -144,6 +368,8 @@ private:
                 jobject dexCl,
                 jstring entryClassName,
                 jobject entryClassObj,
+                jclass threadClass,
+                jobject currentThread,
                 JNIEnv *env
             ) {
                 if (clClass) env->DeleteLocalRef(clClass);
@@ -153,7 +379,9 @@ private:
                 if (dexCl) env->DeleteLocalRef(dexCl);
                 if (entryClassName) env->DeleteLocalRef(entryClassName);
                 if (entryClassObj) env->DeleteLocalRef(entryClassObj);
-                LOGD("JNI resources released!");
+                if (threadClass) env->DeleteLocalRef(threadClass);
+                if (currentThread) env->DeleteLocalRef(currentThread);
+                LOGD("injectDex resources released!");
             },
             static_cast<jclass>(nullptr),
             static_cast<jobject>(nullptr),
@@ -161,6 +389,8 @@ private:
             static_cast<jobject>(nullptr),
             static_cast<jobject>(nullptr),
             static_cast<jstring>(nullptr),
+            static_cast<jobject>(nullptr),
+            static_cast<jclass>(nullptr),
             static_cast<jobject>(nullptr),
             env
         );
@@ -213,6 +443,64 @@ private:
             return;
         }
 
+        LOGD("Set the context class loader to the InMemoryDexClassLoader");
+        auto threadClass = env->FindClass("java/lang/Thread");
+        if (!threadClass) {
+            LOGE("Failed to find Thread class");
+            return;
+        }
+        if (ref.try_set<RefE::ThreadClass>(threadClass)) return;
+
+        auto currentThreadMethod = env->GetStaticMethodID(threadClass, "currentThread", "()Ljava/lang/Thread;");
+        if (!currentThreadMethod) {
+            LOGE("Failed to get currentThread method");
+            return;
+        }
+
+        auto currentThread = env->CallStaticObjectMethod(threadClass, currentThreadMethod);
+        if (!currentThread) {
+            LOGE("Failed to get current thread");
+            return;
+        }
+        if (ref.try_set<RefE::CurrentThread>(currentThread)) return;
+
+        auto setContextClassLoaderMethod = env->GetMethodID(
+            env->GetObjectClass(currentThread), 
+            "setContextClassLoader", 
+            "(Ljava/lang/ClassLoader;)V"
+        );
+        if (!setContextClassLoaderMethod) {
+            LOGE("Failed to get setContextClassLoader method");
+            env->DeleteLocalRef(currentThread);
+            return;
+        }
+
+        env->CallVoidMethod(currentThread, setContextClassLoaderMethod, dexCl);
+
+        if (env->ExceptionCheck()) {
+            LOGE("Exception occurred while setting context class loader");
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            return;
+        }
+
+        LOGD("Register native code with the JVM");
+        using JNI_OnLoadFunc = jint (*)(JavaVM*, void*);
+        JNI_OnLoadFunc onLoadFunc = reinterpret_cast<JNI_OnLoadFunc>(dlsym(lib_handle, "JNI_OnLoad"));
+        if (!onLoadFunc) {
+            LOGE("Failed to find JNI_OnLoad function: %s", dlerror());
+            return;
+        }
+
+        JavaVM* vm;
+        if (env->GetJavaVM(&vm) == JNI_OK) {
+            LOGD("Calling JNI_OnLoad (manually)");
+            onLoadFunc(vm, nullptr);
+        } else {
+            LOGE("Failed to get JavaVM from JNIEnv");
+            return;
+        }
+
         LOGD("Call entry point init");
         auto entryInit = env->GetStaticMethodID(static_cast<jclass>(entryClassObj), "init", "()V");
         env->CallStaticVoidMethod(static_cast<jclass>(entryClassObj), entryInit);
@@ -229,29 +517,106 @@ private:
 };
 
 static void companion(int fd) {
-    if (wasHandled()) {
-        size_t dexSize = 0;
-        utils::xwrite(fd, &dexSize, sizeof(size_t));
-        close(fd);
-        return;
+    auto cmd = static_cast<CompanionCmd>(-1);
+
+    while (1) {
+        if (utils::xread(fd, &cmd, sizeof(cmd)) < 0) {
+            LOGE("Error receiving command");
+            close(fd);
+            return;
+        }
+
+        LOGD("Received cmd: %d", cmd);
+
+        if (cmd == CompanionCmd::LOAD_DEX_AND_LIB) {
+            if (wasHandled()) {
+                size_t dexSize = 0;
+                utils::xwrite(fd, &dexSize, sizeof(size_t));
+                close(fd);
+                return;
+            }
+
+            setHandled();
+
+            // load dex
+            std::vector<char> dex;
+            
+            if (std::filesystem::exists(DEX_PATH)) {
+                dex = utils::readFile(DEX_PATH);
+            }
+
+            size_t dexSize = dex.size();
+            utils::xwrite(fd, &dexSize, sizeof(size_t));
+
+            if (dexSize) {
+                utils::xwrite(fd, dex.data(), dexSize);
+            } else {
+                close(fd);
+                return;
+            }
+
+            // load lib
+            std::vector<char> lib;
+
+            char libpath[256];
+            snprintf(libpath, sizeof(libpath), LIB_PATH, ARCH);
+
+            if (std::filesystem::exists(libpath)) {
+                lib = utils::readFile(libpath);
+            }
+
+            size_t libSize = lib.size();
+            utils::xwrite(fd, &libSize, sizeof(size_t));
+
+            if (libSize) {
+                utils::xwrite(fd, lib.data(), libSize);
+            }   
+        }
+
+        else if (cmd == CompanionCmd::MOD_LIB) {
+            // Receive the file descriptor
+            int lib_fd = recv_fd(fd);
+            if (lib_fd < 0) {
+                LOGE("Failed to receive file descriptor");
+                int ack = -1;
+                utils::xwrite(fd, &ack, sizeof(ack));
+                close(fd);
+                return;
+            }
+
+            // Verify the file descriptor
+            struct stat st;
+            if (fstat(lib_fd, &st) == 0) {
+                LOGD("File exists with size: %llu", static_cast<unsigned long long>(st.st_size));
+            } else {
+                LOGE("fstat failed: %s", strerror(errno));
+                close(lib_fd);
+                int ack = -1;
+                utils::xwrite(fd, &ack, sizeof(ack));
+                close(fd);
+                return;
+            }
+
+            if (fchmod(lib_fd, 0755) == -1) {
+                LOGE("Failed to permission on lib file descriptor");
+            } else {
+                LOGD("Set permission on lib file descriptor");
+            }
+
+            int ack = 0;
+            utils::xwrite(fd, &ack, sizeof(ack));
+
+            close(lib_fd);
+            close(fd);
+            return;
+        }
+
+        else {
+            LOGE("Received unexpected cmd: %d - terminate now", cmd);
+            close(fd);
+            return;
+        }
     }
-
-    setHandled();
-
-    std::vector<char> dex;
-
-    if (std::filesystem::exists(DEX_PATH)) {
-        dex = utils::readFile(DEX_PATH);
-    }
-
-    size_t dexSize = dex.size();
-    utils::xwrite(fd, &dexSize, sizeof(size_t));
-
-    if (dexSize) {
-        utils::xwrite(fd, dex.data(), dexSize);
-    }
-
-    close(fd);
 }
 
 REGISTER_ZYGISK_MODULE(ZNModSample)

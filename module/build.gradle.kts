@@ -108,8 +108,16 @@ androidComponents.onVariants { variant ->
             abiList.forEach { abi ->
                 val arch = abiMap[abi]
                 from(layout.buildDirectory.file("intermediates/stripped_native_libs/$variantLowered/strip${variantCapped}DebugSymbols/out/lib/$abi")) {
+                    include("lib${moduleId}.so")
                     into("zygisk")
-                    rename { fileName -> "${abi}.so" }
+                    rename("lib${moduleId}.so", "${abi}.so")
+                }
+            }
+            abiList.forEach { abi ->
+                val arch = abiMap[abi]
+                from(layout.buildDirectory.file("intermediates/stripped_native_libs/$variantLowered/strip${variantCapped}DebugSymbols/out/lib/$abi")) {
+                    exclude("lib${moduleId}.so")
+                    into("lib/$arch")
                 }
             }
 
@@ -185,4 +193,5 @@ androidComponents.onVariants { variant ->
 
 dependencies {
     implementation(libs.cxx)
+    implementation("org.lsposed.lsplant:lsplant-standalone:+")
 }
