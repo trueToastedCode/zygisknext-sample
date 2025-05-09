@@ -356,8 +356,12 @@ private:
             EntryClassName,
             EntryClassObj,
             ThreadClass,
-            CurrentThread
+            CurrentThread,
+            OriginalClassLoader,
+            SetContextClassLoaderMethod
         };
+
+        bool needRestoreClassLoader = true;
 
         auto ref = resourceguard::make_resource_guard(
             [](
@@ -370,8 +374,15 @@ private:
                 jobject entryClassObj,
                 jclass threadClass,
                 jobject currentThread,
+                jobject originalClassLoader,
+                jmethodID setContextClassLoaderMethod,
+                bool *needRestoreClassLoader,
                 JNIEnv *env
             ) {
+                if (*needRestoreClassLoader && currentThread && setContextClassLoaderMethod && originalClassLoader) {
+                    LOGD("Restore original context ClassLoader");
+                    env->CallVoidMethod(currentThread, setContextClassLoaderMethod, originalClassLoader);
+                }
                 if (clClass) env->DeleteLocalRef(clClass);
                 if (systemClassLoader) env->DeleteLocalRef(systemClassLoader);
                 if (dexClClass) env->DeleteLocalRef(dexClClass);
@@ -381,6 +392,7 @@ private:
                 if (entryClassObj) env->DeleteLocalRef(entryClassObj);
                 if (threadClass) env->DeleteLocalRef(threadClass);
                 if (currentThread) env->DeleteLocalRef(currentThread);
+                if (originalClassLoader) env->DeleteGlobalRef(originalClassLoader);
                 LOGD("injectDex resources released!");
             },
             static_cast<jclass>(nullptr),
@@ -392,6 +404,9 @@ private:
             static_cast<jobject>(nullptr),
             static_cast<jclass>(nullptr),
             static_cast<jobject>(nullptr),
+            static_cast<jobject>(nullptr),
+            static_cast<jmethodID>(nullptr),
+            &needRestoreClassLoader,
             env
         );
 
@@ -464,6 +479,16 @@ private:
         }
         if (ref.try_set<RefE::CurrentThread>(currentThread)) return;
 
+        auto getContextClassLoaderMethod = env->GetMethodID(
+            env->GetObjectClass(currentThread), 
+            "getContextClassLoader", 
+            "()Ljava/lang/ClassLoader;"
+        );
+        if (!getContextClassLoaderMethod) {
+            LOGE("Failed to get getContextClassLoader method");
+            return;
+        }
+
         auto setContextClassLoaderMethod = env->GetMethodID(
             env->GetObjectClass(currentThread), 
             "setContextClassLoader", 
@@ -471,10 +496,17 @@ private:
         );
         if (!setContextClassLoaderMethod) {
             LOGE("Failed to get setContextClassLoader method");
-            env->DeleteLocalRef(currentThread);
             return;
         }
+        if (ref.try_set<RefE::SetContextClassLoaderMethod>(setContextClassLoaderMethod)) return;
 
+        auto originalClassLoader = env->CallObjectMethod(currentThread, getContextClassLoaderMethod);
+        if (originalClassLoader) {
+            originalClassLoader = env->NewGlobalRef(originalClassLoader); // Promote to global ref
+            if (ref.try_set<RefE::OriginalClassLoader>(originalClassLoader)) return;
+        }
+
+        // Set InMemoryDexClassLoader as the context class loader
         env->CallVoidMethod(currentThread, setContextClassLoaderMethod, dexCl);
 
         if (env->ExceptionCheck()) {
@@ -484,6 +516,7 @@ private:
             return;
         }
 
+        // call JNI_OnLoad
         LOGD("Register native code with the JVM");
         using JNI_OnLoadFunc = jint (*)(JavaVM*, void*);
         JNI_OnLoadFunc onLoadFunc = reinterpret_cast<JNI_OnLoadFunc>(dlsym(lib_handle, "JNI_OnLoad"));
@@ -500,6 +533,11 @@ private:
             LOGE("Failed to get JavaVM from JNIEnv");
             return;
         }
+
+        // restore the original class loader
+        LOGD("Restore original context ClassLoader");
+        needRestoreClassLoader = false;
+        env->CallVoidMethod(currentThread, setContextClassLoaderMethod, originalClassLoader);
 
         LOGD("Call entry point init");
         auto entryInit = env->GetStaticMethodID(static_cast<jclass>(entryClassObj), "init", "()V");
