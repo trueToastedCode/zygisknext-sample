@@ -381,7 +381,7 @@ private:
                 bool *needRestoreClassLoader,
                 JNIEnv *env
             ) {
-                if (*needRestoreClassLoader && currentThread && setContextClassLoaderMethod && originalClassLoader) {
+                if (*needRestoreClassLoader && currentThread && setContextClassLoaderMethod) {
                     LOGD("Restore original context ClassLoader");
                     env->CallVoidMethod(currentThread, setContextClassLoaderMethod, originalClassLoader);
                 }
