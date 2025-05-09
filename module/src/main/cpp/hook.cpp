@@ -332,7 +332,9 @@ public:
         dexVector.shrink_to_fit();
         libVector.clear();
         libVector.shrink_to_fit();
-        dlclose(lib_handle);
+
+        // dlclose(lib_handle);
+        // DO NOT dlclose(lib_handle)! Let the OS unload it when the app dies.
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs *args) override {
