@@ -8,14 +8,14 @@
 #include <optional>
 
 /**
- * @namespace scopedlocalref
+ * @namespace resourceguard
  * @brief Provides RAII (Resource Acquisition Is Initialization) utilities for managing resources
  * 
- * This namespace contains the ScopedLocalRef class template which implements the RAII idiom
+ * This namespace contains the ResourceGuard class template which implements the RAII idiom
  * for automatic resource cleanup. It handles multiple resources of different types simultaneously
  * and provides safe resource management with customizable deletion policies.
  */
-namespace scopedlocalref {
+namespace resourceguard {
 
     /**
      * @brief Default trait for validity checking of resources
@@ -70,11 +70,11 @@ namespace scopedlocalref {
     };
 
     /**
-     * @class ScopedLocalRef
+     * @class ResourceGuard
      * @brief RAII wrapper for managing one or more resources
      * 
-     * ScopedLocalRef is a class template that manages the lifecycle of one or more resources.
-     * It ensures resources are properly cleaned up when the ScopedLocalRef instance goes out of scope
+     * ResourceGuard is a class template that manages the lifecycle of one or more resources.
+     * It ensures resources are properly cleaned up when the ResourceGuard instance goes out of scope
      * or is explicitly released. The class supports move semantics but prevents copying to ensure
      * clear ownership of resources.
      * 
@@ -82,7 +82,7 @@ namespace scopedlocalref {
      * @tparam Resources The types of resources to manage
      */
     template<typename Deleter, typename... Resources>
-    class ScopedLocalRef {
+    class ResourceGuard {
         std::tuple<Resources...> m_resources;  ///< Tuple containing the managed resources
         Deleter m_deleter;                     ///< Function object for resource cleanup
         bool m_released = false;               ///< Flag indicating if resources have been released
@@ -108,7 +108,7 @@ namespace scopedlocalref {
 
     public:
         /**
-         * @brief Constructs a ScopedLocalRef with the specified deleter and resources
+         * @brief Constructs a ResourceGuard with the specified deleter and resources
          * 
          * @tparam D Deleter type (deduced)
          * @tparam Args Resource types (deduced)
@@ -116,23 +116,23 @@ namespace scopedlocalref {
          * @param args The resources to manage
          */
         template<typename D, typename... Args>
-        explicit ScopedLocalRef(D&& deleter, Args&&... args)
+        explicit ResourceGuard(D&& deleter, Args&&... args)
             : m_deleter(std::forward<D>(deleter)),
               m_resources(std::forward<Args>(args)...) {}
 
         /**
          * @brief Destructor, automatically cleans up resources if not already released
          */
-        ~ScopedLocalRef() { cleanup(); }
+        ~ResourceGuard() { cleanup(); }
 
         /**
          * @brief Move constructor
          * 
-         * Transfers ownership of resources from another ScopedLocalRef
+         * Transfers ownership of resources from another ResourceGuard
          * 
-         * @param other The ScopedLocalRef to move from
+         * @param other The ResourceGuard to move from
          */
-        ScopedLocalRef(ScopedLocalRef&& other) noexcept
+         ResourceGuard(ResourceGuard&& other) noexcept
             : m_resources(std::move(other.m_resources)),
               m_deleter(std::move(other.m_deleter)),
               m_released(other.m_released) {
@@ -142,13 +142,13 @@ namespace scopedlocalref {
         /**
          * @brief Move assignment operator
          * 
-         * Transfers ownership of resources from another ScopedLocalRef,
+         * Transfers ownership of resources from another ResourceGuard,
          * cleaning up any resources this instance currently owns
          * 
-         * @param other The ScopedLocalRef to move from
+         * @param other The ResourceGuard to move from
          * @return Reference to this instance
          */
-        ScopedLocalRef& operator=(ScopedLocalRef&& other) noexcept {
+         ResourceGuard& operator=(ResourceGuard&& other) noexcept {
             if (this != &other) {
                 cleanup();
                 m_resources = std::move(other.m_resources);
@@ -291,7 +291,7 @@ namespace scopedlocalref {
         // /**
         //  * @brief Transfers ownership of resources to caller
         //  * 
-        //  * After calling steal(), the ScopedLocalRef no longer manages the resources,
+        //  * After calling steal(), the ResourceGuard no longer manages the resources,
         //  * and the caller is responsible for cleanup
         //  * 
         //  * @return Tuple containing all resources
@@ -306,29 +306,29 @@ namespace scopedlocalref {
         /**
          * @brief Copy constructor (deleted)
          * 
-         * ScopedLocalRef doesn't support copying to ensure clear ownership semantics
+         * ResourceGuard doesn't support copying to ensure clear ownership semantics
          */
-        ScopedLocalRef(const ScopedLocalRef&) = delete;
+        ResourceGuard(const ResourceGuard&) = delete;
         
         /**
          * @brief Copy assignment operator (deleted)
          * 
-         * ScopedLocalRef doesn't support copying to ensure clear ownership semantics
+         * ResourceGuard doesn't support copying to ensure clear ownership semantics
          */
-        ScopedLocalRef& operator=(const ScopedLocalRef&) = delete;
+        ResourceGuard& operator=(const ResourceGuard&) = delete;
     };
 
     /**
-     * @brief Helper function to create ScopedLocalRef instances with type deduction
+     * @brief Helper function to create ResourceGuard instances with type deduction
      * 
-     * This function template automatically deduces types for ScopedLocalRef creation,
+     * This function template automatically deduces types for ResourceGuard creation,
      * simplifying its usage with the correct template argument order (Deleter first, then Resources).
      * 
      * @tparam Deleter The type of deleter function/object
      * @tparam Args The types of resources to manage
      * @param deleter Function object that will be called to clean up resources
      * @param args The resources to manage
-     * @return A ScopedLocalRef instance managing the given resources
+     * @return A ResourceGuard instance managing the given resources
      * 
      * @example
      * // Example: Managing a FILE* resource
@@ -348,8 +348,8 @@ namespace scopedlocalref {
      * );
      */
     template<typename Deleter, typename... Args>
-    auto make_scoped_ref(Deleter&& deleter, Args&&... args) {
-        return ScopedLocalRef<
+    auto make_resource_guard(Deleter&& deleter, Args&&... args) {
+        return ResourceGuard<
             std::decay_t<Deleter>,      // Deleter type first
             std::decay_t<Args>...       // Resource types after
         >(
@@ -358,4 +358,4 @@ namespace scopedlocalref {
         );
     }
 
-} // namespace scopedlocalref
+} // namespace ResourceGuard

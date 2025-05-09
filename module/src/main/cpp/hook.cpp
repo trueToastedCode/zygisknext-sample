@@ -8,7 +8,7 @@
 #include "zygisk_api.h"
 #include "zygisk_next_api.h"
 #include "utils.hpp"
-#include "scopedlocalref.hpp"
+#include "resourceguard.hpp"
 
 #define LOG_TAG "znmodsample"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
@@ -135,7 +135,7 @@ private:
             EntryClassObj
         };
 
-        auto ref = scopedlocalref::make_scoped_ref(
+        auto ref = resourceguard::make_resource_guard(
             [](
                 jclass clClass,
                 jobject systemClassLoader,
