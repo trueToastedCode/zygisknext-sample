@@ -25,11 +25,12 @@ android {
         }
         externalNativeBuild {
             cmake {
-                cppFlags("-std=c++20")
+                cppFlags("-std=c++23")
                 arguments(
-                    "-DANDROID_STL=none",
+                    "-DANDROID_STL=c++_static",
                     "-DMODULE_NAME=$moduleId"
                 )
+                version = "3.31.6"
             }
         }
     }
@@ -40,6 +41,7 @@ android {
         }
         */
         cmake {
+            version = "3.31.6"
             path("src/main/cpp/CMakeLists.txt")
         }
     }
@@ -191,7 +193,4 @@ androidComponents.onVariants { variant ->
     }
 }
 
-dependencies {
-    implementation(libs.cxx)
-    implementation("org.lsposed.lsplant:lsplant-standalone:+")
-}
+dependencies {}

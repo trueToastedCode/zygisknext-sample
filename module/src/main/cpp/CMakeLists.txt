@@ -1,20 +1,38 @@
 cmake_minimum_required(VERSION 3.22.1)
 project(hostsredirect)
 
-set(CXX_FLAGS "${CXX_FLAGS} -fno-exceptions -fno-rtti -fvisibility=hidden -fvisibility-inlines-hidden")
+# Diese Flags sind entscheidend für die Android-NDK-Integration
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} \
+    -fno-exceptions \
+    -fno-rtti \
+    -fvisibility=hidden \
+    -fvisibility-inlines-hidden")
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CXX_FLAGS}")
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(cxx REQUIRED CONFIG)
-link_libraries(cxx::cxx)
+# System-Header hinzufügen
+include_directories(
+    ${ANDROID_SYSROOT}/usr/include
+    ${ANDROID_NDK}/sources/android/native_app_glue
+)
 
-# Erste Library - das Zygisk-Modul selbst
 add_library(${MODULE_NAME} SHARED hook.cpp utils.cpp)
-target_link_libraries(${MODULE_NAME} log)
+target_link_libraries(${MODULE_NAME} 
+    log 
+    c++_static
+    android
+)
 
-# Zweite Library - für EntryPoint.java
 add_library(entrypoint_lib SHARED entrypoint_lib/entrypoint_lib.cpp)
-# JNI-Header-Verzeichnis hinzufügen
-include_directories(${ANDROID_NDK}/sources/android/native_app_glue)
-# JNI-Bindung für die zweite Library
-target_link_libraries(entrypoint_lib android log)
+target_link_libraries(entrypoint_lib 
+    log 
+    c++_static
+    android
+)
+
+# Zusätzliche Sicherheit für Android-Typen
+target_compile_definitions(${MODULE_NAME} PRIVATE
+    -D__STDC_LIMIT_MACROS
+    -D__STDC_CONSTANT_MACROS
+)
