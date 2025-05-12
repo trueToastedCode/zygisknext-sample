@@ -13,6 +13,8 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} \
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+find_package(dobby REQUIRED CONFIG)
+
 # System-Header hinzufügen
 include_directories(
     ${ANDROID_SYSROOT}/usr/include
@@ -35,7 +37,10 @@ target_compile_definitions(${MODULE_NAME} PRIVATE
     -D__STDC_CONSTANT_MACROS
 )
 
-add_library(entrypoint_lib SHARED entrypoint_lib/entrypoint_lib.cpp)
+add_library(entrypoint_lib SHARED 
+    entrypoint_lib/entrypoint_lib.cpp
+    entrypoint_lib/Utils/elf_img.cpp
+)
 
 target_include_directories(entrypoint_lib PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/LSPlant/lsplant/src/main/jni/include
@@ -47,6 +52,7 @@ target_link_libraries(entrypoint_lib
     log 
     c++_static
     android
+    dobby::dobby
 )
 
 # Zusätzliche Sicherheit für Android-Typen

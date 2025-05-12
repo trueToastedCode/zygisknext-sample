@@ -1,34 +1,54 @@
 package de.truetoastedcode.znmodsample;
 
 import android.util.Log;
+import java.lang.reflect.Method;
 
 public final class EntryPoint {
     private static final String TAG = "znmodsample";
 
-    public static void init() {
-        Thread worker = new Thread(() -> {
-            long startTime = System.currentTimeMillis();
-            long duration = 2 * 60 * 1000; // 2 minutes in milliseconds
-
-            while (System.currentTimeMillis() - startTime < duration) {
-                try {
-                    nativeMethod();
-                    Thread.sleep(5000);  // Wait 5 seconds
-                } catch (InterruptedException e) {
-                    Log.w(TAG, "Worker thread interrupted", e);
-                    Thread.currentThread().interrupt();
-                    break;
-                } catch (Exception e) {
-                    Log.e(TAG, "Error calling native method", e);
-                }
-            }
-
-            Log.i(TAG, "Finished periodic native calls after 2 minutes");
-        });
-
-        worker.setDaemon(true); // Optional
-        worker.start();
+    public void foo(int i) {
+        Log.i(TAG, String.format("foo(%1$s) invoked!", i));
     }
 
-    private static native void nativeMethod();
+    // Replacement method for foo
+    public Object hookedFoo(Hooker.MethodCallback callback) {
+        // Custom logic before the original method
+        int arg = (Integer) callback.args[1]; // Unbox to int
+        Log.i(TAG, "Hooked method called with argument: " + arg);
+        arg = 0;
+        
+        try {
+            // Call the original method
+            return callback.backup.invoke(callback.args[0], arg);
+        } catch (Exception e) {
+            Log.e(TAG, "Error invoking original method", e);
+            return null;
+        }
+    }
+
+    public static void init() {
+        try {
+            // Get the original foo method with its parameter type
+            Method originalFoo = EntryPoint.class.getDeclaredMethod("foo", int.class);
+            
+            // Create an instance to use as the owner for the hook
+            EntryPoint entryPoint = new EntryPoint();
+            
+            // Get the replacement method
+            Method replacementMethod = EntryPoint.class.getDeclaredMethod("hookedFoo", Hooker.MethodCallback.class);
+            
+            // Create the hook
+            Hooker hooker = Hooker.hook(originalFoo, replacementMethod, entryPoint);
+            
+            if (hooker == null) {
+                Log.e(TAG, "Failed to create hook");
+            } else {
+                Log.i(TAG, "Hook created successfully");
+            }
+
+            entryPoint.foo(1);
+        } catch (Exception e) {
+            Log.e(TAG, "Error in init hook", e);
+        }
+    }
 }

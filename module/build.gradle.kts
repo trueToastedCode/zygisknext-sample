@@ -193,4 +193,6 @@ androidComponents.onVariants { variant ->
     }
 }
 
-dependencies {}
+dependencies {
+    implementation(libs.dobby)
+}
