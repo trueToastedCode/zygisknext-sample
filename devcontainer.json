@@ -1,0 +1,15 @@
+{
+  "name": "Ubuntu Dev Container",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "settings": {
+    "terminal.integrated.defaultProfile.linux": "bash"
+  },
+  "extensions": [
+    "ms-vscode.cpptools",           // Beispiel: C/C++ Unterstützung
+    "ms-azuretools.vscode-docker"   // Docker Extension
+  ],
+  "remoteUser": "vscode"
+}
+
